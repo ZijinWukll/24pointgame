@@ -8,6 +8,14 @@
     let currentNumbers = [];
     /** @type {string | null} */
     let currentSolution = null;
+    /**
+     * 按“按钮输入单位”维护的表达式 token 列表。
+     * 例如依次点击 1、3 会得到 ["1","3"]；
+     * 依次点击 13 会得到 ["13"]，用于删除时的粒度控制。
+     * 只通过 appendToken/deleteAtCursor/clear 重建，不接受键盘直接改动。
+     * @type {string[]}
+     */
+    let inputTokens = [];
 
     function $(id) {
         const el = document.getElementById(id);
@@ -255,26 +263,107 @@
         }
     }
 
-    function appendToken(token) {
+    function rebuildInputFromTokens() {
         const input = $("exprInput");
-        input.value = input.value + token;
+        const value = inputTokens.join("");
+        input.value = value;
+        return value;
+    }
+
+    function getTokenBoundaries() {
+        /** @type {number[]} */
+        const boundaries = [0];
+        let pos = 0;
+        for (const t of inputTokens) {
+            pos += t.length;
+            boundaries.push(pos);
+        }
+        return boundaries;
+    }
+
+    function syncInputCaret(caretPos) {
+        const input = $("exprInput");
+        const value = inputTokens.join("");
+        input.value = value;
+        const pos = Math.max(0, Math.min(caretPos, value.length));
+        try {
+            input.setSelectionRange(pos, pos);
+            input.focus();
+        } catch { }
+    }
+
+    function normalizeCaretToBoundary() {
+        const input = $("exprInput");
+        const value = inputTokens.join("");
+        if (input.value !== value) input.value = value;
+
+        const boundaries = getTokenBoundaries();
+        if (!boundaries.length) {
+            try {
+                input.setSelectionRange(0, 0);
+            } catch { }
+            return 0;
+        }
+
+        const raw = input.selectionStart != null ? input.selectionStart : value.length;
+        let nearest = boundaries[0];
+        let minDist = Math.abs(raw - boundaries[0]);
+        for (let i = 1; i < boundaries.length; i++) {
+            const b = boundaries[i];
+            const d = Math.abs(raw - b);
+            if (d < minDist) {
+                minDist = d;
+                nearest = b;
+            }
+        }
+        try {
+            input.setSelectionRange(nearest, nearest);
+        } catch { }
+        return nearest;
+    }
+
+    function appendToken(token) {
+        // 根据当前光标位置（自动吸附到 token 边界）在 token 列表中插入一个新的 token
+        const input = $("exprInput");
+        // 先确保 input 与 token 列表同步
+        rebuildInputFromTokens();
+        const caretBoundary = normalizeCaretToBoundary();
+        const boundaries = getTokenBoundaries();
+        let insertIndex = boundaries.indexOf(caretBoundary);
+        if (insertIndex === -1) insertIndex = inputTokens.length;
+
+        inputTokens.splice(insertIndex, 0, token);
+        const newBoundaries = getTokenBoundaries();
+        const newCaret = newBoundaries[insertIndex + 1];
+        syncInputCaret(newCaret);
         hideHint();
         setMessage("继续输入，或点击“确定”验证答案", undefined);
     }
 
-    function deleteLastToken() {
-        const input = $("exprInput");
-        let s = input.value;
-        if (!s) return;
+    function deleteAtCursor() {
+        if (!inputTokens.length) return;
 
-        // 末尾是数字：删除一整个数字 token（1~13，因此可能两位数）
-        if (/\d$/.test(s)) {
-            s = s.replace(/\d+$/, "");
-        } else {
-            // 运算符/括号：删一个字符（含 × ÷ −）
-            s = s.slice(0, -1);
-        }
-        input.value = s;
+        const input = $("exprInput");
+        // 保证 input 与 token 列表同步
+        rebuildInputFromTokens();
+
+        // 不考虑选择一段文本的情况：若有选区，先收缩到起点，再按“一个 token”为单位删除
+        const rawStart = input.selectionStart != null ? input.selectionStart : input.value.length;
+        try {
+            input.setSelectionRange(rawStart, rawStart);
+        } catch { }
+
+        const caretBoundary = normalizeCaretToBoundary();
+        const boundaries = getTokenBoundaries();
+        let boundaryIndex = boundaries.indexOf(caretBoundary);
+        if (boundaryIndex <= 0) return; // 光标在最前面，没有可删 token
+
+        const removeIndex = boundaryIndex - 1; // 删除光标前面的一个 token
+        inputTokens.splice(removeIndex, 1);
+
+        const newBoundaries = getTokenBoundaries();
+        const newCaret = newBoundaries[removeIndex];
+        syncInputCaret(newCaret);
         hideHint();
         setMessage("已删除一个输入", undefined);
     }
@@ -327,7 +416,8 @@
     function newGame() {
         setMessage("正在生成可解题目…", undefined);
         hideHint();
-        $("exprInput").value = "";
+        inputTokens = [];
+        syncInputCaret(0);
 
         let nums;
         let sol = null;
@@ -363,13 +453,80 @@
         try {
             const value = evalExpression(input);
             if (Math.abs(value - TARGET) < EPS) {
-                setMessage(`正确！结果 = ${value},真是太聪明啦！`, "ok");
+                // 先校验是否严格按题目给出的四个数字、且每个数字只用一次
+                const usageError = validateNumberUsage(input, currentNumbers);
+                if (usageError) {
+                    setMessage(usageError, "bad");
+                } else {
+                    setMessage(`正确！结果 = ${value},真是太聪明啦！`, "ok");
+                }
             } else {
                 setMessage(`还差一点点：结果 = ${value}，不是 24，加油再试试！`, "bad");
             }
         } catch (err) {
             setMessage(err instanceof Error ? err.message : "表达式解析失败", "bad");
         }
+    }
+
+    /**
+     * 检查表达式中的数字是否与题目给出的四个数字严格一一对应。
+     * - 若有数字漏用或多用：返回 "犯规了哦，每个数字必须用一次且只能用一次"；
+     * - 若出现题目中不存在的数字（包括小数）：返回 "犯规了哦，你用了题目里没有的数字"；
+     * - 否则返回 null。
+     * @param {string} expr
+     * @param {number[]} nums
+     * @returns {string | null}
+     */
+    function validateNumberUsage(expr, nums) {
+        const clean = expr
+            .replaceAll("×", "*")
+            .replaceAll("÷", "/")
+            .replaceAll("−", "-");
+        const tokens = tokenize(clean);
+
+        /** @type {number[]} */
+        const used = [];
+        for (const t of tokens) {
+            if (t.type === "num") {
+                const v = Math.abs(t.value);
+                used.push(v);
+            }
+        }
+
+        // 数量不对：肯定不是“每个数字一次且仅一次”
+        if (used.length !== nums.length) {
+            return "犯规了哦！";
+        }
+
+        // 题目数字频次表
+        /** @type {Record<string, number>} */
+        const need = {};
+        for (const n of nums) {
+            const k = String(n);
+            need[k] = (need[k] ?? 0) + 1;
+        }
+
+        for (const v of used) {
+            const rounded = Math.round(v);
+            // 必须是整数，且在 1~13 范围内
+            if (Math.abs(v - rounded) > EPS) {
+                return "犯规了哦！";
+            }
+            const key = String(rounded);
+            if (!need[key]) {
+                // 题目中没有这个整数，或已经被用完
+                return "犯规了哦！";
+            }
+            need[key]--;
+        }
+
+        // 若还有剩余，说明有数字没用到
+        for (const k in need) {
+            if (Object.prototype.hasOwnProperty.call(need, k) && need[k] !== 0) {
+                return "犯规了哦！";
+            }
+        }
+        return null;
     }
 
     function bindEvents() {
@@ -399,13 +556,43 @@
         // 只允许点按输入：输入框不接受键盘编辑
         const input = $("exprInput");
         input.addEventListener("keydown", (e) => {
+            // 允许 Tab/Escape 的默认行为（不改内容）
             if (e.key === "Tab" || e.key === "Escape") return;
+
+            // 只允许左右方向键移动光标
+            if (e.key === "ArrowLeft" || e.key === "ArrowRight") return;
+
+            // Backspace：按与“删除”按钮相同的规则，删掉一个 token
+            if (e.key === "Backspace") {
+                e.preventDefault();
+                deleteAtCursor();
+                return;
+            }
+
+            // 其它按键（包括数字、运算符、字母、Delete、上下键等）全部拦截，禁止键盘直接修改内容
             e.preventDefault();
         });
 
-        $("delBtn").addEventListener("click", () => deleteLastToken());
+        // 从更底层拦截所有输入类操作（包括粘贴、输入法等），彻底禁止键盘修改内容
+        input.addEventListener("beforeinput", (e) => {
+            // 所有类型一律阻止，实际内容改动只通过按钮和 token 逻辑完成
+            e.preventDefault();
+        });
+
+        // 防止通过粘贴改变内容
+        input.addEventListener("paste", (e) => {
+            e.preventDefault();
+        });
+
+        // 如果仍然有 input 事件（极端情况下），强制把内容恢复为 token 拼接结果
+        input.addEventListener("input", () => {
+            rebuildInputFromTokens();
+        });
+
+        $("delBtn").addEventListener("click", () => deleteAtCursor());
         $("clearBtn").addEventListener("click", () => {
-            $("exprInput").value = "";
+            inputTokens = [];
+            syncInputCaret(0);
             hideHint();
             setMessage("已清空输入", undefined);
         });
